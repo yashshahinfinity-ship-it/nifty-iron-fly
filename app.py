@@ -423,15 +423,28 @@ with tab_in:
         today_call = [c for c in calls() if c.get("for_session") == datetime.now(IST).strftime("%Y-%m-%d")]
         if today_call:
             sig = {"signal": today_call[-1]["signal"], "p": float(today_call[-1]["p_high_vol"] or 0), "vix": 0.0}
-    blank = pd.DataFrame({"Action": [None] * 4, "Type": [None] * 4, "Strike": [None] * 4,
-                          "Lots": [None] * 4, "Price": [None] * 4})
+    sp = st.session_state.get("spot_now") or sig.get("spot")
+    vx = st.session_state.get("vix_now") or sig.get("vix")
+    if sp and vx:
+        atm, _s, wing = suggest(float(sp), float(vx))
+        blank = pd.DataFrame({"Action": ["Buy", "Buy", "Sell", "Sell"], "Type": ["CE", "PE", "CE", "PE"],
+                              "Strike": [atm + wing, atm - wing, atm, atm], "Lots": [1, 1, 1, 1],
+                              "Price": [None] * 4})
+        fill_key = f"{atm}_{wing}"
+        st.caption(f"Auto-filled iron fly from the Signal tab: ATM {atm}, wings {wing} points. "
+                   "Type only the prices. Change any strike or lot if your actual order was different.")
+    else:
+        blank = pd.DataFrame({"Action": [None] * 4, "Type": [None] * 4, "Strike": [None] * 4,
+                              "Lots": [None] * 4, "Price": [None] * 4})
+        fill_key = "blank"
+        st.caption("Press the signal button in tab 1 first and the 4 legs will be filled in for you.")
     with st.form("entry_form"):
         c1, c2, c3 = st.columns(3)
         dte = c1.selectbox("DTE (days to expiry)", list(range(0, 8)), index=None, placeholder="pick")
         lot = c2.number_input("Lot size", value=DEFAULT_LOT, step=1, help="Check your broker, NSE revises this.")
         spot_e = c3.number_input("NIFTY spot at entry", value=None, step=1.0, placeholder="type")
         legs_df = st.data_editor(
-            blank, num_rows="dynamic", width="stretch", hide_index=True, key="entry_legs_editor",
+            blank, num_rows="dynamic", width="stretch", hide_index=True, key=f"entry_legs_editor_{fill_key}",
             column_config={
                 "Action": st.column_config.SelectboxColumn("Buy/Sell", options=["Buy", "Sell"]),
                 "Type": st.column_config.SelectboxColumn("Call/Put", options=["CE", "PE"]),
@@ -517,7 +530,11 @@ with tab_out:
                                        "gross_pnl_rs": round(gross, 2), "charges_rs": round(charges, 2),
                                        "net_pnl_rs": round(net, 2), "status": "CLOSED"}, "Trades")
                     trades(refresh=True)
-                    (st.success if net >= 0 else st.error)(f"Saved ✅  gross ₹{gross:,.0f}  ·  net after charges ₹{net:,.0f}")
+                    msg = f"Saved ✅  gross ₹{gross:,.0f}  ·  net after charges ₹{net:,.0f}"
+                    if net >= 0:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
                 except Exception as e:
                     st.error(f"Could not save to the sheet: {e}")
 
@@ -567,7 +584,10 @@ with tab_sc:
             try:
                 n = verify_pending(calls(refresh=True))
                 calls(refresh=True)
-                st.success(f"Graded {n} call(s).") if n else st.info("Nothing new to grade yet (sessions still open or no data).")
+                if n:
+                    st.success(f"Graded {n} call(s).")
+                else:
+                    st.info("Nothing new to grade yet (sessions still open or no data).")
             except Exception as e:
                 st.error(f"Could not grade: {e}")
     if c2.button("Refresh", key="sc_refresh", width="stretch"):
