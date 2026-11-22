@@ -250,10 +250,26 @@ def get_store():
 
 
 # ---------- call scorecard logic ----------
+def norm_date(x) -> str:
+    """Google Sheets sometimes turns '2026-11-20' into a Date and sends it back as
+    'Fri Nov 20 2026 00:00:00 GMT+0530 (...)' or an ISO time. Always return YYYY-MM-DD."""
+    x = str(x).strip()
+    if not x:
+        return ""
+    try:
+        return str(pd.Timestamp(x).date())
+    except Exception:
+        pass
+    try:
+        return str(datetime.strptime(x[:15], "%a %b %d %Y").date())
+    except Exception:
+        return x
+
+
 def resolve_call(call: dict, ohlc: pd.DataFrame, now: datetime):
     """Was the call right? Looks at the first trading day AFTER the call's data date.
     Returns the fields to save, or None if that day isn't finished yet."""
-    after = ohlc.index[ohlc.index > pd.Timestamp(call["last_date"])]
+    after = ohlc.index[ohlc.index > pd.Timestamp(norm_date(call["last_date"]))]
     if len(after) == 0:
         return None
     day = after[0]
@@ -273,7 +289,7 @@ def verify_pending(calls: list) -> int:
     pend = [c for c in calls if c.get("status") == "PENDING"]
     if not pend:
         return 0
-    first = min(pd.Timestamp(c["last_date"]) for c in pend) - pd.Timedelta(days=5)
+    first = min(pd.Timestamp(norm_date(c["last_date"])) for c in pend) - pd.Timedelta(days=5)
     d = yf.download("^NSEI", start=first.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
     if isinstance(d.columns, pd.MultiIndex):
         d.columns = d.columns.get_level_values(0)
@@ -293,7 +309,12 @@ store = get_store()
 def _cached(name, sheet, refresh=False):
     if refresh or name not in st.session_state:
         try:
-            st.session_state[name] = store.all(sheet)
+            rows = store.all(sheet)
+            for r in rows:
+                for col in ("date", "last_date", "for_session", "actual_date"):
+                    if col in r:
+                        r[col] = norm_date(r[col])
+            st.session_state[name] = rows
             st.session_state.pop(name + "_err", None)
         except Exception as e:
             st.session_state[name] = []
