@@ -33,6 +33,11 @@ CALM_Q = 0.40
 STEP = 50                 # NIFTY strike spacing
 WING_X = 1.5              # wings = 1.5 x the VIX-implied 1-day straddle (same rule as the backtest)
 DEFAULT_LOT = 65          # CHECK your broker: NIFTY lot size is revised by NSE from time to time
+try:
+    START_CAPITAL = float(st.secrets.get("START_CAPITAL", 200000))   # forward-test starting capital (Rs)
+except Exception:
+    START_CAPITAL = 200000.0
+RISK_RULE_PCT = 1.0       # max worst-case loss per trade, % of current capital
 
 st.set_page_config(page_title="NIFTY Iron Fly Tracker", page_icon="📈", layout="centered")
 
@@ -61,6 +66,7 @@ def _features(d, vix):
     df["dist_50dma"] = df["Close"] / df["Close"].rolling(50).mean() - 1
     df["dow"] = df.index.dayofweek
     thr = df["range_pct"].rolling(60).median()
+    df["thr"] = thr
     df["rel_range_1d"] = df["range_pct"] / thr
     df["rel_range_5d"] = df["range_ma5"] / thr
     df["rel_range_20d"] = df["range_ma20"] / thr
@@ -115,7 +121,7 @@ def compute_signal(cache_key: str):
     last_date = latest.index[0]
     nxt_day = last_date + pd.offsets.BDay(1)
     return {
-        "p": p, "signal": signal, "last_date": str(last_date.date()), "for_session": str(nxt_day.date()),
+        "thr": float(df["thr"].loc[latest.index[0]]), "p": p, "signal": signal, "last_date": str(last_date.date()), "for_session": str(nxt_day.date()),
         "spot": float(d["Close"].loc[last_date]), "vix": float(df["vix"].loc[last_date]),
         "auc": float(np.mean(aucs)), "naive_auc": float(np.mean(naive)),
         "after_calm": float(yo[o <= cut_calm].mean()), "after_wild": float(yo[o >= cut_wild].mean()),
@@ -182,26 +188,28 @@ def pnl_rs(legs: list, lot: int) -> float:
 
 
 # ============================== storage ==============================
-HEADERS = ["id", "date", "signal", "p_high_vol", "vix", "dte", "lot_size", "spot_entry", "entry_legs",
-           "entry_time", "exit_time", "spot_exit", "exit_legs", "legs_text", "gross_pnl_rs", "charges_rs",
-           "net_pnl_rs", "status", "notes"]
+HEADERS_BY = {
+    "Trades": ["id", "date", "signal", "p_high_vol", "vix", "dte", "lot_size", "spot_entry", "entry_legs",
+               "entry_time", "exit_time", "spot_exit", "exit_legs", "legs_text", "gross_pnl_rs", "charges_rs",
+               "net_pnl_rs", "status", "notes"],
+    "Calls": ["last_date", "for_session", "signal", "p_high_vol", "thr", "made_at", "status", "actual_date",
+              "actual_range_pct", "actual_big", "verdict"],
+}
+KEY = {"Trades": "id", "Calls": "last_date"}
 
 
 class LocalStore:
     kind = "local"
 
-    def __init__(self):
-        st.session_state.setdefault("local_rows", [])
+    def all(self, sheet="Trades"):
+        return list(st.session_state.setdefault(f"local_{sheet}", []))
 
-    def all(self):
-        return list(st.session_state["local_rows"])
+    def add(self, row, sheet="Trades"):
+        st.session_state.setdefault(f"local_{sheet}", []).append({k: str(row.get(k, "")) for k in HEADERS_BY[sheet]})
 
-    def add(self, row):
-        st.session_state["local_rows"].append(dict(row))
-
-    def close(self, trade_id, fields):
-        for r in st.session_state["local_rows"]:
-            if r["id"] == trade_id:
+    def update(self, key, fields, sheet="Trades"):
+        for r in st.session_state.setdefault(f"local_{sheet}", []):
+            if r[KEY[sheet]] == key:
                 r.update({k: str(v) for k, v in fields.items()})
 
 
@@ -211,23 +219,26 @@ class SheetStore:
     def __init__(self, url, token):
         self.url, self.token = url, token
 
-    def _call(self, action, **kw):
-        r = requests.post(self.url, data=json.dumps({"token": self.token, "action": action, **kw}),
+    def _call(self, action, sheet, **kw):
+        r = requests.post(self.url, data=json.dumps({"token": self.token, "action": action, "sheet": sheet, **kw}),
                           headers={"Content-Type": "text/plain"}, timeout=40)
         r.raise_for_status()
         j = r.json()
         if not j.get("ok"):
             raise RuntimeError(j.get("error", "unknown error from the sheet script"))
+        if j.get("sheet") != sheet:
+            raise RuntimeError("Your Google Apps Script is out of date. Paste the new apps_script.gs, then "
+                               "Deploy > Manage deployments > pencil > Version: New version > Deploy.")
         return j
 
-    def all(self):
-        return self._call("list")["rows"]
+    def all(self, sheet="Trades"):
+        return self._call("list", sheet)["rows"]
 
-    def add(self, row):
-        self._call("add", row={k: str(row.get(k, "")) for k in HEADERS})
+    def add(self, row, sheet="Trades"):
+        self._call("add", sheet, row={k: str(row.get(k, "")) for k in HEADERS_BY[sheet]})
 
-    def close(self, trade_id, fields):
-        self._call("close", id=trade_id, fields={k: str(v) for k, v in fields.items()})
+    def update(self, key, fields, sheet="Trades"):
+        self._call("update", sheet, key=str(key), fields={k: str(v) for k, v in fields.items()})
 
 
 def get_store():
@@ -238,7 +249,83 @@ def get_store():
         return LocalStore()
 
 
+# ---------- call scorecard logic ----------
+def resolve_call(call: dict, ohlc: pd.DataFrame, now: datetime):
+    """Was the call right? Looks at the first trading day AFTER the call's data date.
+    Returns the fields to save, or None if that day isn't finished yet."""
+    after = ohlc.index[ohlc.index > pd.Timestamp(call["last_date"])]
+    if len(after) == 0:
+        return None
+    day = after[0]
+    if day.date() == now.date() and (now.hour, now.minute) < (15, 45):
+        return None
+    row = ohlc.loc[day]
+    rng = float((row["High"] - row["Low"]) / row["Close"])
+    thr = float(call["thr"])
+    big = rng > thr
+    sig = call["signal"]
+    verdict = "NO CALL" if sig == "NEUTRAL" else ("RIGHT" if (sig == "HIGH-VOL") == big else "WRONG")
+    return {"status": "DONE", "actual_date": str(day.date()), "actual_range_pct": round(100 * rng, 3),
+            "actual_big": "BIG" if big else "QUIET", "verdict": verdict}
+
+
+def verify_pending(calls: list) -> int:
+    pend = [c for c in calls if c.get("status") == "PENDING"]
+    if not pend:
+        return 0
+    first = min(pd.Timestamp(c["last_date"]) for c in pend) - pd.Timedelta(days=5)
+    d = yf.download("^NSEI", start=first.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    d = d.dropna(subset=["High", "Low", "Close"])
+    now, n = datetime.now(IST), 0
+    for c in pend:
+        res = resolve_call(c, d, now)
+        if res:
+            store.update(c["last_date"], res, "Calls")
+            n += 1
+    return n
+
+
 store = get_store()
+
+
+def _cached(name, sheet, refresh=False):
+    if refresh or name not in st.session_state:
+        try:
+            st.session_state[name] = store.all(sheet)
+            st.session_state.pop(name + "_err", None)
+        except Exception as e:
+            st.session_state[name] = []
+            st.session_state[name + "_err"] = str(e)
+    return st.session_state[name]
+
+
+def trades(refresh=False):
+    return _cached("rows_cache", "Trades", refresh)
+
+
+def calls(refresh=False):
+    return _cached("calls_cache", "Calls", refresh)
+
+
+def capital_now():
+    t = pd.DataFrame(trades()).reindex(columns=HEADERS_BY["Trades"]) if trades() else pd.DataFrame()
+    if t.empty or "status" not in t:
+        return START_CAPITAL, 0.0
+    pnl = pd.to_numeric(t.loc[t["status"] == "CLOSED", "net_pnl_rs"], errors="coerce").sum()
+    return START_CAPITAL + float(pnl), float(pnl)
+
+
+def log_call(sig):
+    """Record today's prediction once per data date, so we can grade it after the session."""
+    if any(c.get("last_date") == sig["last_date"] for c in calls()):
+        return False
+    store.add({"last_date": sig["last_date"], "for_session": sig["for_session"], "signal": sig["signal"],
+               "p_high_vol": f"{sig['p']:.3f}", "thr": f"{sig['thr']:.6f}", "made_at": sig["made_at"],
+               "status": "PENDING"}, "Calls")
+    calls(refresh=True)
+    return True
 
 # ============================== UI ==============================
 st.title("📈 NIFTY Iron Fly Tracker")
@@ -248,7 +335,16 @@ else:
     st.warning("Google Sheet not connected: trades live only in this browser session. "
                "Download the CSV in the Review tab before you close the page.", icon="⚠️")
 
-tab_sig, tab_in, tab_out, tab_rev = st.tabs(["1 Signal", "2 Enter trade", "3 Exit trade", "4 Review"])
+_cap, _pnl = capital_now()
+h1, h2, h3 = st.columns(3)
+h1.metric("Capital now", f"₹{_cap:,.0f}")
+h2.metric("Net P&L", f"₹{_pnl:,.0f}")
+h3.metric("Return", f"{100 * _pnl / START_CAPITAL:.2f}%", help=f"Started with ₹{START_CAPITAL:,.0f}")
+for _n in ("rows_cache_err", "calls_cache_err"):
+    if st.session_state.get(_n):
+        st.error(st.session_state[_n])
+
+tab_sig, tab_in, tab_out, tab_rev, tab_sc = st.tabs(["1 Signal", "2 Enter trade", "3 Exit trade", "4 Review", "5 Scorecard"])
 
 # ---------------------------- tab 1: signal ----------------------------
 with tab_sig:
@@ -259,6 +355,11 @@ with tab_sig:
         with st.spinner("Downloading data and running the model (about a minute)…"):
             try:
                 st.session_state["sig"] = compute_signal(datetime.now(IST).strftime("%Y-%m-%d %H%M"))
+                try:
+                    if log_call(st.session_state["sig"]):
+                        st.toast("Call recorded in your Scorecard ✅")
+                except Exception as e:
+                    st.error(f"Signal OK, but I could not record it: {e}")
             except Exception as e:
                 st.error(f"Could not run the model: {e}")
 
@@ -297,6 +398,10 @@ with tab_sig:
 with tab_in:
     st.markdown("**Fill the boxes with what you actually traded.** Leave unused rows blank.")
     sig = st.session_state.get("sig") or {}
+    if not sig:                                           # fall back to today's recorded call
+        today_call = [c for c in calls() if c.get("for_session") == datetime.now(IST).strftime("%Y-%m-%d")]
+        if today_call:
+            sig = {"signal": today_call[-1]["signal"], "p": float(today_call[-1]["p_high_vol"] or 0), "vix": 0.0}
     blank = pd.DataFrame({"Action": [None] * 4, "Type": [None] * 4, "Strike": [None] * 4,
                           "Lots": [None] * 4, "Price": [None] * 4})
     with st.form("entry_form"):
@@ -328,7 +433,11 @@ with tab_in:
                 st.error("⚠️ This shape has UNLIMITED loss on the upside (a naked short leg). "
                          "Our test was for defined-risk iron flies only. Saved anyway, but think twice.")
             else:
-                st.info(f"Worst case at expiry: ₹{rp['max_loss']:,.0f}  ·  best case at expiry: ₹{rp['max_profit']:,.0f}")
+                pct = 100 * -rp["max_loss"] / _cap if _cap else 0
+                st.info(f"Worst case at expiry: ₹{rp['max_loss']:,.0f} ({pct:.1f}% of your capital ₹{_cap:,.0f})  ·  "
+                        f"best case: ₹{rp['max_profit']:,.0f}")
+                if pct > RISK_RULE_PCT:
+                    st.warning(f"That is above your {RISK_RULE_PCT:.0f}% per-trade risk rule. Consider narrower wings or fewer lots.")
             n_sell, n_buy = (legs["Action"] == "Sell").sum(), (legs["Action"] == "Buy").sum()
             if len(legs) == 4 and not (n_sell == 2 and n_buy == 2):
                 st.warning("4 legs but not 2 sells + 2 buys: double-check the Buy/Sell column.")
@@ -336,12 +445,13 @@ with tab_in:
             now = datetime.now(IST)
             ll = legs.to_dict("records")
             row = {"id": trade_id, "date": now.strftime("%Y-%m-%d"), "signal": sig.get("signal", "n/a"),
-                   "p_high_vol": f"{sig['p']:.3f}" if sig else "", "vix": f"{sig['vix']:.2f}" if sig else "",
+                   "p_high_vol": f"{sig['p']:.3f}" if sig else "", "vix": f"{sig['vix']:.2f}" if sig.get("vix") else "",
                    "dte": int(dte), "lot_size": int(lot), "spot_entry": spot_e or "",
                    "entry_legs": json.dumps(ll), "entry_time": now.strftime("%H:%M"), "legs_text": legs_text(ll),
                    "status": "OPEN", "notes": notes}
             try:
-                store.add(row)
+                store.add(row, "Trades")
+                trades(refresh=True)
                 st.success(f"Saved ✅  trade id {trade_id}. Go to the Exit tab when you close it.")
             except Exception as e:
                 st.error(f"Could not save to the sheet: {e}")
@@ -349,14 +459,8 @@ with tab_in:
 # ---------------------------- tab 3: exit trade ----------------------------
 with tab_out:
     if st.button("Refresh open trades", width="stretch"):
-        st.session_state.pop("rows_cache", None)
-    try:
-        if "rows_cache" not in st.session_state:
-            st.session_state["rows_cache"] = store.all()
-        rows = st.session_state["rows_cache"]
-    except Exception as e:
-        rows = []
-        st.error(f"Could not read the sheet: {e}")
+        trades(refresh=True)
+    rows = trades()
     open_rows = [r for r in rows if str(r.get("status")) == "OPEN"]
     if not open_rows:
         st.caption("No open trades.")
@@ -387,22 +491,20 @@ with tab_out:
                 gross = pnl_rs(legs_x, int(lot))
                 net = gross - charges
                 try:
-                    store.close(pick, {"exit_time": datetime.now(IST).strftime("%H:%M"), "spot_exit": spot_x or "",
+                    store.update(pick, {"exit_time": datetime.now(IST).strftime("%H:%M"), "spot_exit": spot_x or "",
                                        "exit_legs": json.dumps(legs_x), "legs_text": legs_text(legs_x),
                                        "gross_pnl_rs": round(gross, 2), "charges_rs": round(charges, 2),
-                                       "net_pnl_rs": round(net, 2), "status": "CLOSED"})
-                    st.session_state.pop("rows_cache", None)
+                                       "net_pnl_rs": round(net, 2), "status": "CLOSED"}, "Trades")
+                    trades(refresh=True)
                     (st.success if net >= 0 else st.error)(f"Saved ✅  gross ₹{gross:,.0f}  ·  net after charges ₹{net:,.0f}")
                 except Exception as e:
                     st.error(f"Could not save to the sheet: {e}")
 
 # ---------------------------- tab 4: review ----------------------------
 with tab_rev:
-    try:
-        rows = store.all()
-    except Exception as e:
-        rows, _ = [], st.error(f"Could not read the sheet: {e}")
-    allr = pd.DataFrame(rows)
+    if st.button("Refresh", key="rev_refresh", width="stretch"):
+        trades(refresh=True)
+    allr = pd.DataFrame(trades()).reindex(columns=HEADERS_BY["Trades"]) if trades() else pd.DataFrame()
     if allr.empty or "status" not in allr:
         st.caption("No trades yet.")
     else:
@@ -417,10 +519,12 @@ with tab_rev:
             m1.metric("Net P&L", f"₹{cl['net_pnl_rs'].sum():,.0f}")
             m2.metric("Win rate", f"{(cl['net_pnl_rs'] > 0).mean():.0%}")
             m3.metric("Worst trade", f"₹{cl['net_pnl_rs'].min():,.0f}")
-            curve = cl["net_pnl_rs"].cumsum().reset_index(drop=True)
-            curve.index = range(1, len(curve) + 1)                      # x axis = trade number (no date parsing)
-            st.markdown("**Cumulative net P&L by trade number**")
-            st.line_chart(curve.rename("Cumulative net ₹"))
+            equity = START_CAPITAL + cl["net_pnl_rs"].cumsum().reset_index(drop=True)
+            equity.index = range(1, len(equity) + 1)                    # x axis = trade number (no date parsing)
+            peak = equity.cummax()
+            st.markdown(f"**Capital by trade number** (start ₹{START_CAPITAL:,.0f})")
+            st.line_chart(equity.rename("Capital ₹"))
+            st.caption(f"Max drawdown so far: {100 * ((equity - peak) / peak).min():.1f}%")
             by = cl.groupby("signal")["net_pnl_rs"].agg(trades="size", avg="mean", total="sum").round(0)
             st.markdown("**By signal at entry**")
             st.dataframe(by, width="stretch")
@@ -431,3 +535,64 @@ with tab_rev:
                 st.caption("Under ~20 trades this is just noise. Keep going before drawing conclusions.")
         st.download_button("Download all trades (CSV)", allr.to_csv(index=False), "nifty_trades.csv",
                            "text/csv", width="stretch")
+
+# ---------------------------- tab 5: scorecard ----------------------------
+with tab_sc:
+    st.write("Every time you press the signal button, the call is recorded. After the session ends, press "
+             "**Check results** and the app grades it: was the day really calm / big?")
+    c1, c2 = st.columns(2)
+    if c1.button("Check results now", type="primary", width="stretch"):
+        with st.spinner("Grading finished sessions…"):
+            try:
+                n = verify_pending(calls(refresh=True))
+                calls(refresh=True)
+                st.success(f"Graded {n} call(s).") if n else st.info("Nothing new to grade yet (sessions still open or no data).")
+            except Exception as e:
+                st.error(f"Could not grade: {e}")
+    if c2.button("Refresh", key="sc_refresh", width="stretch"):
+        calls(refresh=True)
+        trades(refresh=True)
+
+    cdf = pd.DataFrame(calls()).reindex(columns=HEADERS_BY["Calls"]) if calls() else pd.DataFrame()
+    if cdf.empty or "status" not in cdf:
+        st.caption("No calls recorded yet. Press the signal button in tab 1.")
+    else:
+        done = cdf[cdf["status"] == "DONE"].copy()
+        pend = cdf[cdf["status"] == "PENDING"]
+        tdf = pd.DataFrame(trades()).reindex(columns=HEADERS_BY["Trades"]) if trades() else pd.DataFrame()
+        if not done.empty:
+            last = done.sort_values("actual_date").iloc[-1]
+            mine = ""
+            if not tdf.empty and "date" in tdf:
+                day_tr = tdf[(tdf["date"] == last["actual_date"]) & (tdf["status"] == "CLOSED")]
+                if len(day_tr):
+                    mine = f"  ·  your trade that day: net ₹{pd.to_numeric(day_tr['net_pnl_rs'], errors='coerce').sum():,.0f}"
+            icon = {"RIGHT": "✅", "WRONG": "❌", "NO CALL": "➖"}.get(last["verdict"], "")
+            st.subheader(f"{icon} Latest verdict: {last['verdict']}")
+            st.write(f"Call for **{last['actual_date']}** was **{last['signal']}**. The day's range was "
+                     f"**{last['actual_range_pct']}%** vs a 'normal' of {100 * float(last['thr']):.2f}% "
+                     f"→ it was a **{last['actual_big']}** day{mine}.")
+            dec = done[done["verdict"].isin(["RIGHT", "WRONG"])]
+            if len(dec):
+                acc = dec.groupby("signal")["verdict"].agg(calls="size", right=lambda x: (x == "RIGHT").sum())
+                acc["accuracy"] = (100 * acc["right"] / acc["calls"]).round(0).astype(int).astype(str) + "%"
+                st.markdown("**Forward-test accuracy**")
+                st.dataframe(acc, width="stretch")
+                st.caption(f"Overall: {(dec['verdict'] == 'RIGHT').mean():.0%} of {len(dec)} decisive calls right. "
+                           "Backtest said about 67-68%. Under ~30 calls this is mostly noise.")
+            # does a RIGHT call turn into profit? join trades to graded calls by session date
+            if not tdf.empty and "date" in tdf:
+                cl = tdf[tdf["status"] == "CLOSED"].copy()
+                cl["net"] = pd.to_numeric(cl["net_pnl_rs"], errors="coerce")
+                j = cl.merge(done[["actual_date", "signal", "verdict"]], left_on="date", right_on="actual_date",
+                             how="inner", suffixes=("", "_call"))
+                if len(j):
+                    st.markdown("**Your trades by call result**")
+                    st.dataframe(j.groupby("verdict")["net"].agg(trades="size", avg="mean", total="sum").round(0),
+                                 width="stretch")
+        if len(pend):
+            st.caption(f"{len(pend)} call(s) waiting for their session to finish.")
+        show = cdf.copy()
+        show["thr"] = (100 * pd.to_numeric(show["thr"], errors="coerce")).round(2)
+        st.markdown("**All recorded calls**")
+        st.dataframe(show.iloc[::-1].rename(columns={"thr": "normal range %"}), width="stretch", hide_index=True)
