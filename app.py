@@ -187,6 +187,87 @@ def pnl_rs(legs: list, lot: int) -> float:
     return tot
 
 
+
+# ============================== entry checks ==============================
+def check_structure(legs: pd.DataFrame, spot=None, wing=None):
+    """Wrong strikes / wrong side / naked legs. Returns (errors, warnings)."""
+    errs, warns = [], []
+    ex_w = wing or 300
+    bad = legs[(legs["Strike"] % STEP) != 0]
+    if len(bad):
+        errs.append(f"Strike(s) {sorted(set(int(x) for x in bad['Strike']))} are not multiples of {STEP}. NIFTY strikes move in steps of {STEP}.")
+    dup = legs[legs.duplicated(["Type", "Strike"], keep=False)]
+    if len(dup):
+        errs.append("The same strike and type appears twice (e.g. you both buy and sell the same option). Check the rows.")
+    for typ in ("CE", "PE"):
+        sells = legs[(legs["Type"] == typ) & (legs["Action"] == "Sell")]
+        buys = legs[(legs["Type"] == typ) & (legs["Action"] == "Buy")]
+        if len(sells) and buys.empty:
+            k = int(sells["Strike"].iloc[0])
+            errs.append(f"Sold {k} {typ} has no protection. Buy a farther {typ} (e.g. {k + ex_w if typ == 'CE' else k - ex_w} {typ}). "
+                        "This forward test is for defined-risk iron flies only.")
+        for b in buys.itertuples():
+            if len(sells) == 0:
+                continue
+            if typ == "CE" and b.Strike <= sells["Strike"].min():
+                k = int(sells["Strike"].min())
+                errs.append(f"Wrong leg: bought {int(b.Strike)} CE is not above your sold {k} CE. "
+                            f"Protection for a sold CE must be HIGHER, e.g. {k + ex_w} CE.")
+            if typ == "PE" and b.Strike >= sells["Strike"].max():
+                k = int(sells["Strike"].max())
+                errs.append(f"Wrong leg: bought {int(b.Strike)} PE is not below your sold {k} PE. "
+                            f"Protection for a sold PE must be LOWER, e.g. {k - ex_w} PE.")
+    if legs["Lots"].nunique() > 1:
+        warns.append("Lots differ between legs. Part of the position may be unprotected.")
+    if spot:
+        atm = round(spot / STEP) * STEP
+        for r in legs[legs["Action"] == "Sell"].itertuples():
+            if abs(r.Strike - atm) >= 2 * STEP:
+                warns.append(f"Sold {int(r.Strike)} {r.Type} is {abs(int(r.Strike - spot))} points from spot {spot:,.0f}: that is not at-the-money.")
+    return errs, warns
+
+
+def check_prices(legs: pd.DataFrame, col="Price", credit=False):
+    """A farther-out option must never cost more than a nearer one of the same type."""
+    errs = []
+    for typ in ("CE", "PE"):
+        t = legs[legs["Type"] == typ]
+        for a in t.itertuples():
+            for b in t.itertuples():
+                pa, pb = float(getattr(a, col)), float(getattr(b, col))
+                nearer = (a.Strike < b.Strike) if typ == "CE" else (a.Strike > b.Strike)
+                if nearer and pa < pb - 1e-9:
+                    errs.append(f"Price looks wrong: {int(b.Strike)} {typ} ({b.Action}, ₹{pb:g}) costs MORE than "
+                                f"{int(a.Strike)} {typ} ({a.Action}, ₹{pa:g}). A farther-out {typ} must be cheaper.")
+    if credit:
+        cr = sum((1 if r.Action == "Sell" else -1) * float(getattr(r, col)) * r.Lots for r in legs.itertuples())
+        if cr <= 0:
+            errs.append(f"Net DEBIT of {abs(cr):.2f} points: an iron fly should bring in a net credit. Check which prices went in which row.")
+    return errs
+
+
+@st.dialog("Please fix these first")
+def show_problems(msgs):
+    for m in msgs:
+        st.error(m)
+    st.caption("Close this box, correct the table, then press Save again.")
+
+
+def block(msgs):
+    """Tell the user nothing was saved (pop-up + a line on the page)."""
+    st.error(f"Not saved: {len(msgs)} problem(s) found.")
+    try:
+        show_problems(msgs)
+    except Exception:
+        for m in msgs:
+            st.error(m)
+
+
+def next_tuesday(today=None):
+    d = today or datetime.now(IST).date()
+    return d + timedelta(days=(1 - d.weekday()) % 7)
+
+
 # ============================== storage ==============================
 HEADERS_BY = {
     "Trades": ["id", "date", "signal", "p_high_vol", "vix", "dte", "lot_size", "spot_entry", "entry_legs",
@@ -348,6 +429,80 @@ def log_call(sig):
     calls(refresh=True)
     return True
 
+
+def run_grading() -> int:
+    """Grade every finished session and refresh the cache. Returns how many calls were graded."""
+    n = verify_pending(calls(refresh=True))
+    calls(refresh=True)
+    return n
+
+
+def grading_message(n: int):
+    if n:
+        st.success(f"Graded {n} call(s).")
+        return
+    now = datetime.now(IST)
+    today_open = (now.hour, now.minute) < (15, 45) and now.weekday() < 5
+    pend_today = [c for c in calls() if c.get("status") == "PENDING" and c.get("for_session") == now.strftime("%Y-%m-%d")]
+    if pend_today and today_open:
+        st.info("Today's session is still open. The verdict is available after 3:45 PM IST.")
+    else:
+        st.info("Nothing new to grade yet (no finished session waiting, or no data yet).")
+
+
+def render_verdict(full: bool):
+    """Latest verdict + forward-test accuracy. full=True adds the trade join and the whole call log."""
+    cdf = pd.DataFrame(calls()).reindex(columns=HEADERS_BY["Calls"]) if calls() else pd.DataFrame()
+    if cdf.empty or "status" not in cdf:
+        st.caption("No calls recorded yet. Press 'Get today's signal' first.")
+        return
+    done = cdf[cdf["status"] == "DONE"].copy()
+    pend = cdf[cdf["status"] == "PENDING"]
+    tdf = pd.DataFrame(trades()).reindex(columns=HEADERS_BY["Trades"]) if trades() else pd.DataFrame()
+    if not done.empty:
+        last = done.sort_values("actual_date").iloc[-1]
+        mine = "  ·  you took no trade that day"
+        if not tdf.empty:
+            day_tr = tdf[(tdf["date"] == last["actual_date"]) & (tdf["status"] == "CLOSED")]
+            if len(day_tr):
+                mine = f"  ·  your trade that day: net ₹{pd.to_numeric(day_tr['net_pnl_rs'], errors='coerce').sum():,.0f}"
+        icon = {"RIGHT": "✅", "WRONG": "❌", "NO CALL": "➖"}.get(last["verdict"], "")
+        st.subheader(f"{icon} Latest verdict: {last['verdict']}")
+        st.write(f"Call for **{last['actual_date']}** was **{last['signal']}**. The day's range was "
+                 f"**{last['actual_range_pct']}%** vs a 'normal' of {100 * float(last['thr']):.2f}% "
+                 f"→ it was a **{last['actual_big']}** day{mine}.")
+        dec = done[done["verdict"].isin(["RIGHT", "WRONG"])]
+        if len(dec):
+            acc = dec.groupby("signal")["verdict"].agg(calls="size", right=lambda x: (x == "RIGHT").sum())
+            acc["accuracy"] = (100 * acc["right"] / acc["calls"]).round(0).astype(int).astype(str) + "%"
+            if full:
+                st.markdown("**Forward-test accuracy**")
+                st.dataframe(acc, width="stretch")
+            else:
+                parts = " · ".join(f"{k}: {int(v.right)}/{int(v.calls)} right" for k, v in acc.iterrows())
+                st.markdown(f"**Forward test so far:** {int((dec['verdict'] == 'RIGHT').sum())} of {len(dec)} "
+                            f"decisive calls right ({(dec['verdict'] == 'RIGHT').mean():.0%})  ·  {parts}")
+            st.caption("Backtest said about 67-68%. Under ~30 calls this is mostly noise.")
+        if full and not tdf.empty:
+            cl = tdf[tdf["status"] == "CLOSED"].copy()
+            cl["net"] = pd.to_numeric(cl["net_pnl_rs"], errors="coerce")
+            j = cl.merge(done[["actual_date", "signal", "verdict"]], left_on="date", right_on="actual_date",
+                         how="inner", suffixes=("", "_call"))
+            if len(j):
+                st.markdown("**Your trades by call result**")
+                st.dataframe(j.groupby("verdict")["net"].agg(trades="size", avg="mean", total="sum").round(0),
+                             width="stretch")
+    else:
+        st.caption("No call has been graded yet.")
+    if len(pend):
+        st.caption(f"{len(pend)} call(s) waiting for their session to finish.")
+    if full:
+        show = cdf.copy()
+        show["thr"] = (100 * pd.to_numeric(show["thr"], errors="coerce")).round(2)
+        st.markdown("**All recorded calls**")
+        st.dataframe(show.iloc[::-1].rename(columns={"thr": "normal range %"}), width="stretch", hide_index=True)
+
+
 # ============================== UI ==============================
 st.title("📈 NIFTY Iron Fly Tracker")
 if store.kind == "sheet":
@@ -415,34 +570,59 @@ with tab_sig:
     else:
         st.caption("No signal yet. Press the button.")
 
+    st.divider()
+    st.subheader("Day-end verdict")
+    st.caption("Press this after 3:45 PM IST. It grades the latest call against what NIFTY actually did that day, "
+               "whether or not you took a trade. Every graded call is saved in your Scorecard.")
+    if st.button("Get day-end verdict", type="primary", key="verdict_btn", width="stretch"):
+        with st.spinner("Checking what the market did…"):
+            try:
+                grading_message(run_grading())
+            except Exception as e:
+                st.error(f"Could not grade: {e}")
+    render_verdict(full=False)
+
 # ---------------------------- tab 2: enter trade ----------------------------
 with tab_in:
-    st.markdown("**Fill the boxes with what you actually traded.** Leave unused rows blank.")
+    st.markdown("**Step 1: set expiry, spot and wing. Step 2: type only the 4 prices.** Strikes fill in by themselves.")
     sig = st.session_state.get("sig") or {}
     if not sig:                                           # fall back to today's recorded call
         today_call = [c for c in calls() if c.get("for_session") == datetime.now(IST).strftime("%Y-%m-%d")]
         if today_call:
             sig = {"signal": today_call[-1]["signal"], "p": float(today_call[-1]["p_high_vol"] or 0), "vix": 0.0}
-    sp = st.session_state.get("spot_now") or sig.get("spot")
-    vx = st.session_state.get("vix_now") or sig.get("vix")
-    if sp and vx:
-        atm, _s, wing = suggest(float(sp), float(vx))
+    today = datetime.now(IST).date()
+    sp0 = st.session_state.get("spot_now") or sig.get("spot")
+    vx0 = st.session_state.get("vix_now") or sig.get("vix")
+    wing0 = suggest(float(sp0), float(vx0))[2] if (sp0 and vx0) else 300
+
+    c1, c2 = st.columns(2)
+    expiry = c1.date_input("Expiry date (calendar)", value=next_tuesday(today), min_value=today, format="DD/MM/YYYY",
+                           help="Pick the expiry you traded. The app works out the days to expiry (DTE) from today.")
+    dte = (expiry - today).days
+    c1.caption(f"DTE = {dte} day(s)")
+    lot = c2.number_input("Lot size", value=DEFAULT_LOT, step=1, help="Check your broker, NSE revises this.")
+    c3, c4 = st.columns(2)
+    spot_e = c3.number_input("NIFTY spot at entry", value=float(round(sp0)) if sp0 else None, step=1.0,
+                             placeholder="type, e.g. 25900", key="spot_entry",
+                             help="Type the live NIFTY level. The sold strikes jump to the nearest 50 automatically.")
+    wing = c4.number_input("Wing distance (points)", value=int(wing0), step=STEP, min_value=STEP, key="wing_pts",
+                           help="How far the bought strikes sit from the sold ones. Default = 1.5 x the VIX-implied move.")
+
+    if spot_e:
+        atm = int(round(spot_e / STEP) * STEP)
         blank = pd.DataFrame({"Action": ["Buy", "Buy", "Sell", "Sell"], "Type": ["CE", "PE", "CE", "PE"],
-                              "Strike": [atm + wing, atm - wing, atm, atm], "Lots": [1, 1, 1, 1],
+                              "Strike": [atm + int(wing), atm - int(wing), atm, atm], "Lots": [1, 1, 1, 1],
                               "Price": [None] * 4})
-        fill_key = f"{atm}_{wing}"
-        st.caption(f"Auto-filled iron fly from the Signal tab: ATM {atm}, wings {wing} points. "
-                   "Type only the prices. Change any strike or lot if your actual order was different.")
+        fill_key = f"{atm}_{int(wing)}"
+        st.info(f"Spot {spot_e:,.0f} → sell {atm} CE and {atm} PE, buy {atm + int(wing)} CE and {atm - int(wing)} PE. "
+                "Change the spot above and the strikes follow. Set spot and wing first, then type prices.")
     else:
         blank = pd.DataFrame({"Action": [None] * 4, "Type": [None] * 4, "Strike": [None] * 4,
                               "Lots": [None] * 4, "Price": [None] * 4})
         fill_key = "blank"
-        st.caption("Press the signal button in tab 1 first and the 4 legs will be filled in for you.")
+        st.caption("Type the NIFTY spot above and the 4 legs will fill in.")
+
     with st.form("entry_form"):
-        c1, c2, c3 = st.columns(3)
-        dte = c1.selectbox("DTE (days to expiry)", list(range(0, 8)), index=None, placeholder="pick")
-        lot = c2.number_input("Lot size", value=DEFAULT_LOT, step=1, help="Check your broker, NSE revises this.")
-        spot_e = c3.number_input("NIFTY spot at entry", value=None, step=1.0, placeholder="type")
         legs_df = st.data_editor(
             blank, num_rows="dynamic", width="stretch", hide_index=True, key=f"entry_legs_editor_{fill_key}",
             column_config={
@@ -457,32 +637,37 @@ with tab_in:
 
     if go:
         legs = clean_legs(legs_df)
-        if dte is None:
-            st.error("Pick the DTE.")
-        elif legs.empty:
-            st.error("Fill at least one full leg (Buy/Sell, Call/Put, Strike, Lots, Price).")
+        problems = []
+        if not spot_e:
+            problems.append("Type the NIFTY spot at entry.")
+        if legs.empty:
+            problems.append("Fill at least one full leg (Buy/Sell, Call/Put, Strike, Lots, Price).")
+        else:
+            e1, w1 = check_structure(legs, spot_e, int(wing))
+            problems += e1
+            problems += check_prices(legs, "Price", credit=(len(legs) == 4))
+            if len(legs) == 4 and not ((legs["Action"] == "Sell").sum() == 2 and (legs["Action"] == "Buy").sum() == 2):
+                problems.append("4 legs but not 2 sells + 2 buys: check the Buy/Sell column.")
+            for w in w1:
+                st.warning(w)
+        if problems:
+            block(problems)
         else:
             rp = risk_profile(legs, int(lot))
-            if rp["unlimited_loss"]:
-                st.error("⚠️ This shape has UNLIMITED loss on the upside (a naked short leg). "
-                         "Our test was for defined-risk iron flies only. Saved anyway, but think twice.")
-            else:
-                pct = 100 * -rp["max_loss"] / _cap if _cap else 0
-                st.info(f"Worst case at expiry: ₹{rp['max_loss']:,.0f} ({pct:.1f}% of your capital ₹{_cap:,.0f})  ·  "
-                        f"best case: ₹{rp['max_profit']:,.0f}")
-                if pct > RISK_RULE_PCT:
-                    st.warning(f"That is above your {RISK_RULE_PCT:.0f}% per-trade risk rule. Consider narrower wings or fewer lots.")
-            n_sell, n_buy = (legs["Action"] == "Sell").sum(), (legs["Action"] == "Buy").sum()
-            if len(legs) == 4 and not (n_sell == 2 and n_buy == 2):
-                st.warning("4 legs but not 2 sells + 2 buys: double-check the Buy/Sell column.")
+            pct = 100 * -rp["max_loss"] / _cap if (rp["max_loss"] is not None and _cap) else 0
+            st.info(f"Worst case at expiry: ₹{rp['max_loss']:,.0f} ({pct:.1f}% of your capital ₹{_cap:,.0f})  ·  "
+                    f"best case: ₹{rp['max_profit']:,.0f}")
+            if pct > RISK_RULE_PCT:
+                st.warning(f"That is above your {RISK_RULE_PCT:.0f}% per-trade risk rule. Consider narrower wings or fewer lots.")
             trade_id = uuid.uuid4().hex[:8]
             now = datetime.now(IST)
             ll = legs.to_dict("records")
+            note_txt = f"Expiry {expiry:%Y-%m-%d}" + (f" | {notes}" if notes else "")
             row = {"id": trade_id, "date": now.strftime("%Y-%m-%d"), "signal": sig.get("signal", "n/a"),
                    "p_high_vol": f"{sig['p']:.3f}" if sig else "", "vix": f"{sig['vix']:.2f}" if sig.get("vix") else "",
                    "dte": int(dte), "lot_size": int(lot), "spot_entry": spot_e or "",
                    "entry_legs": json.dumps(ll), "entry_time": now.strftime("%H:%M"), "legs_text": legs_text(ll),
-                   "status": "OPEN", "notes": notes}
+                   "status": "OPEN", "notes": note_txt}
             try:
                 store.add(row, "Trades")
                 trades(refresh=True)
@@ -516,11 +701,19 @@ with tab_out:
                 disabled=["Action", "Type", "Strike", "Lots", "Price"],
                 column_config={"Price": st.column_config.NumberColumn("Entry price"),
                                "ExitPrice": st.column_config.NumberColumn("Exit price", step=0.05, min_value=0.0)})
+            force = st.checkbox("Save even if the price checker complains (illiquid strikes can look odd)")
             gox = st.form_submit_button("Save exit", type="primary", width="stretch")
         if gox:
+            exit_problems = []
             if edited["ExitPrice"].isna().any():
                 st.error("Fill the exit price for every leg (use 0 if it expired worthless).")
             else:
+                chk = edited.copy()
+                chk["ExitPrice"] = pd.to_numeric(chk["ExitPrice"], errors="coerce")
+                exit_problems = check_prices(chk, "ExitPrice")
+            if exit_problems and not force:
+                block(exit_problems)
+            elif not edited["ExitPrice"].isna().any():
                 legs_x = edited.to_dict("records")
                 gross = pnl_rs(legs_x, int(lot))
                 net = gross - charges
@@ -577,63 +770,15 @@ with tab_rev:
 # ---------------------------- tab 5: scorecard ----------------------------
 with tab_sc:
     st.write("Every time you press the signal button, the call is recorded. After the session ends, press "
-             "**Check results** and the app grades it: was the day really calm / big?")
+             "**Check results** (here or on the first tab) and the app grades it: was the day really calm / big?")
     c1, c2 = st.columns(2)
     if c1.button("Check results now", type="primary", width="stretch"):
         with st.spinner("Grading finished sessions…"):
             try:
-                n = verify_pending(calls(refresh=True))
-                calls(refresh=True)
-                if n:
-                    st.success(f"Graded {n} call(s).")
-                else:
-                    st.info("Nothing new to grade yet (sessions still open or no data).")
+                grading_message(run_grading())
             except Exception as e:
                 st.error(f"Could not grade: {e}")
     if c2.button("Refresh", key="sc_refresh", width="stretch"):
         calls(refresh=True)
         trades(refresh=True)
-
-    cdf = pd.DataFrame(calls()).reindex(columns=HEADERS_BY["Calls"]) if calls() else pd.DataFrame()
-    if cdf.empty or "status" not in cdf:
-        st.caption("No calls recorded yet. Press the signal button in tab 1.")
-    else:
-        done = cdf[cdf["status"] == "DONE"].copy()
-        pend = cdf[cdf["status"] == "PENDING"]
-        tdf = pd.DataFrame(trades()).reindex(columns=HEADERS_BY["Trades"]) if trades() else pd.DataFrame()
-        if not done.empty:
-            last = done.sort_values("actual_date").iloc[-1]
-            mine = ""
-            if not tdf.empty and "date" in tdf:
-                day_tr = tdf[(tdf["date"] == last["actual_date"]) & (tdf["status"] == "CLOSED")]
-                if len(day_tr):
-                    mine = f"  ·  your trade that day: net ₹{pd.to_numeric(day_tr['net_pnl_rs'], errors='coerce').sum():,.0f}"
-            icon = {"RIGHT": "✅", "WRONG": "❌", "NO CALL": "➖"}.get(last["verdict"], "")
-            st.subheader(f"{icon} Latest verdict: {last['verdict']}")
-            st.write(f"Call for **{last['actual_date']}** was **{last['signal']}**. The day's range was "
-                     f"**{last['actual_range_pct']}%** vs a 'normal' of {100 * float(last['thr']):.2f}% "
-                     f"→ it was a **{last['actual_big']}** day{mine}.")
-            dec = done[done["verdict"].isin(["RIGHT", "WRONG"])]
-            if len(dec):
-                acc = dec.groupby("signal")["verdict"].agg(calls="size", right=lambda x: (x == "RIGHT").sum())
-                acc["accuracy"] = (100 * acc["right"] / acc["calls"]).round(0).astype(int).astype(str) + "%"
-                st.markdown("**Forward-test accuracy**")
-                st.dataframe(acc, width="stretch")
-                st.caption(f"Overall: {(dec['verdict'] == 'RIGHT').mean():.0%} of {len(dec)} decisive calls right. "
-                           "Backtest said about 67-68%. Under ~30 calls this is mostly noise.")
-            # does a RIGHT call turn into profit? join trades to graded calls by session date
-            if not tdf.empty and "date" in tdf:
-                cl = tdf[tdf["status"] == "CLOSED"].copy()
-                cl["net"] = pd.to_numeric(cl["net_pnl_rs"], errors="coerce")
-                j = cl.merge(done[["actual_date", "signal", "verdict"]], left_on="date", right_on="actual_date",
-                             how="inner", suffixes=("", "_call"))
-                if len(j):
-                    st.markdown("**Your trades by call result**")
-                    st.dataframe(j.groupby("verdict")["net"].agg(trades="size", avg="mean", total="sum").round(0),
-                                 width="stretch")
-        if len(pend):
-            st.caption(f"{len(pend)} call(s) waiting for their session to finish.")
-        show = cdf.copy()
-        show["thr"] = (100 * pd.to_numeric(show["thr"], errors="coerce")).round(2)
-        st.markdown("**All recorded calls**")
-        st.dataframe(show.iloc[::-1].rename(columns={"thr": "normal range %"}), width="stretch", hide_index=True)
+    render_verdict(full=True)
